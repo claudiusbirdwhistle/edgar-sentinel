@@ -8,7 +8,7 @@ import pytest
 
 from edgar_sentinel.backtest.engine import BacktestEngine, run_backtest
 from edgar_sentinel.backtest.metrics import MetricsCalculator
-from edgar_sentinel.core.models import BacktestConfig, CompositeSignal
+from edgar_sentinel.core.models import BacktestConfig, CompositeSignal, EquityCurvePoint
 
 
 # --- Mock Returns Provider ---
@@ -31,6 +31,27 @@ class MockReturnsProvider:
         self, tickers: list[str], start: date, end: date
     ) -> pd.DataFrame:
         return self._returns  # Not needed for engine tests
+
+
+class MockFrequencyReturnsProvider:
+    """Mock provider that returns different DataFrames for daily vs monthly frequencies."""
+
+    def __init__(self, monthly_df: pd.DataFrame, daily_df: pd.DataFrame):
+        self._monthly = monthly_df
+        self._daily = daily_df
+
+    def get_returns(
+        self, tickers: list[str], start: date, end: date, frequency: str = "monthly"
+    ) -> pd.DataFrame:
+        df = self._daily if frequency == "daily" else self._monthly
+        mask = (df.index.date >= start) & (df.index.date <= end)
+        cols = [t for t in tickers if t in df.columns]
+        return df.loc[mask, cols]
+
+    def get_prices(
+        self, tickers: list[str], start: date, end: date
+    ) -> pd.DataFrame:
+        return self._daily
 
 
 # --- Fixtures ---
@@ -355,3 +376,256 @@ class TestQuarterlyAnnualization:
             assert mr.period_start is not None
             assert isinstance(mr.period_start, date)
             assert mr.period_start < mr.period_end
+
+
+# --- Equity Curve helpers ---
+
+
+def _make_daily_returns(
+    tickers: list[str] | None = None,
+    start: str = "2020-01-02",
+    end: str = "2022-12-30",
+    seed: int = 99,
+    include_spy: bool = True,
+) -> pd.DataFrame:
+    """Synthetic daily returns: ~252 trading days per year."""
+    if tickers is None:
+        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META",
+                   "NVDA", "TSLA", "JPM", "BAC", "WMT"]
+    all_cols = list(tickers) + (["SPY"] if include_spy else [])
+    dates = pd.bdate_range(start, end)
+    np.random.seed(seed)
+    data = np.random.normal(0.0005, 0.012, size=(len(dates), len(all_cols)))
+    return pd.DataFrame(data, index=dates, columns=all_cols)
+
+
+def _make_zero_daily_returns(
+    tickers: list[str] | None = None,
+    start: str = "2020-01-02",
+    end: str = "2022-12-30",
+    include_spy: bool = True,
+) -> pd.DataFrame:
+    """Zero daily returns so values stay constant at initial_value."""
+    if tickers is None:
+        tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META",
+                   "NVDA", "TSLA", "JPM", "BAC", "WMT"]
+    all_cols = list(tickers) + (["SPY"] if include_spy else [])
+    dates = pd.bdate_range(start, end)
+    data = np.zeros((len(dates), len(all_cols)))
+    return pd.DataFrame(data, index=dates, columns=all_cols)
+
+
+# --- EquityCurvePoint model tests ---
+
+
+class TestEquityCurvePoint:
+    def test_basic_construction(self):
+        pt = EquityCurvePoint(
+            date=date(2020, 1, 31),
+            portfolio_value=10000.0,
+            ew_value=10000.0,
+        )
+        assert pt.portfolio_value == 10000.0
+        assert pt.spy_value is None  # optional
+
+    def test_with_spy(self):
+        pt = EquityCurvePoint(
+            date=date(2020, 1, 31),
+            portfolio_value=10100.0,
+            spy_value=10050.0,
+            ew_value=10080.0,
+        )
+        assert pt.spy_value == 10050.0
+
+    def test_immutable(self):
+        pt = EquityCurvePoint(
+            date=date(2020, 1, 31),
+            portfolio_value=10000.0,
+            ew_value=10000.0,
+        )
+        with pytest.raises(Exception):
+            pt.portfolio_value = 999.0  # frozen model
+
+
+# --- Engine equity curve tests ---
+
+
+class TestEquityCurveComputation:
+    def test_equity_curve_present_in_result(self):
+        """result.equity_curve is non-empty after a successful backtest."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        daily_df = _make_daily_returns()
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert hasattr(result, "equity_curve")
+        assert len(result.equity_curve) > 0
+
+    def test_equity_curve_dates_ascending(self):
+        """Equity curve dates must be strictly non-decreasing."""
+        config = _make_config()
+        provider = MockFrequencyReturnsProvider(_make_returns(), _make_daily_returns())
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        dates = [pt.date for pt in result.equity_curve]
+        assert dates == sorted(dates)
+
+    def test_equity_curve_zero_returns_constant_value(self):
+        """With zero daily returns, portfolio/EW values stay constant at initial_value."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        daily_df = _make_zero_daily_returns()
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert len(result.equity_curve) > 0
+        for pt in result.equity_curve:
+            assert pt.portfolio_value == pytest.approx(10_000.0, rel=1e-6)
+            assert pt.ew_value == pytest.approx(10_000.0, rel=1e-6)
+
+    def test_equity_curve_spy_none_when_absent(self):
+        """spy_value is None for every point when SPY is not in the returns provider."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        daily_df = _make_daily_returns(include_spy=False)
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert len(result.equity_curve) > 0
+        for pt in result.equity_curve:
+            assert pt.spy_value is None
+
+    def test_equity_curve_spy_populated_when_present(self):
+        """spy_value is a float for every point when SPY is in the returns provider."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        daily_df = _make_daily_returns(include_spy=True)
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert len(result.equity_curve) > 0
+        for pt in result.equity_curve:
+            assert pt.spy_value is not None
+            assert isinstance(pt.spy_value, float)
+
+    def test_equity_curve_zero_spy_constant(self):
+        """With zero SPY returns, spy_value stays at 10000 throughout."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        daily_df = _make_zero_daily_returns(include_spy=True)
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        for pt in result.equity_curve:
+            assert pt.spy_value == pytest.approx(10_000.0, rel=1e-6)
+
+    def test_equity_curve_empty_when_no_daily_data(self):
+        """equity_curve is empty when the daily provider returns no data."""
+        config = _make_config()
+        monthly_df = _make_returns()
+        # Empty daily DataFrame (no rows)
+        empty_daily = pd.DataFrame(
+            index=pd.DatetimeIndex([], name="date"),
+            columns=list(_make_config().universe) + ["SPY"],
+            dtype=float,
+        )
+        provider = MockFrequencyReturnsProvider(monthly_df, empty_daily)
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert result.equity_curve == []
+
+    def test_equity_curve_portfolio_tracks_known_return(self):
+        """With a single positive return day, portfolio value increases correctly."""
+        config = _make_config(
+            start_date=date(2020, 1, 1),
+            end_date=date(2020, 6, 30),
+            universe=["AAPL", "MSFT"],
+            rebalance_frequency="quarterly",
+            num_quantiles=2,
+            long_quantile=1,
+            short_quantile=None,
+        )
+        # 1 quarterly rebalance: Q1 2020
+        monthly_dates = pd.date_range("2020-01-31", periods=6, freq="ME")
+        monthly_data = np.full((6, 2), 0.01)
+        monthly_df = pd.DataFrame(monthly_data, index=monthly_dates, columns=["AAPL", "MSFT"])
+
+        # Daily: one trading day with known returns
+        daily_dates = pd.bdate_range("2020-01-02", "2020-06-30")
+        # AAPL returns 0.01 per day, MSFT 0.02 per day
+        daily_data = np.column_stack([
+            np.full(len(daily_dates), 0.01),
+            np.full(len(daily_dates), 0.02),
+        ])
+        daily_df = pd.DataFrame(daily_data, index=daily_dates, columns=["AAPL", "MSFT"])
+
+        signals = _make_signals(
+            tickers=["AAPL", "MSFT"],
+            dates=[date(2020, 3, 31)],
+        )
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert len(result.equity_curve) > 0
+        # Values should be growing (positive daily returns)
+        values = [pt.portfolio_value for pt in result.equity_curve]
+        assert values[-1] > values[0]
+
+    def test_equity_curve_ew_uses_equal_weights(self):
+        """EW curve applies equal weights to all universe tickers."""
+        config = _make_config(
+            start_date=date(2020, 1, 1),
+            end_date=date(2020, 6, 30),
+            universe=["AAPL", "MSFT"],
+            rebalance_frequency="quarterly",
+            num_quantiles=2,
+            long_quantile=1,
+            short_quantile=None,
+        )
+        monthly_dates = pd.date_range("2020-01-31", periods=6, freq="ME")
+        monthly_df = pd.DataFrame(
+            np.full((6, 2), 0.01),
+            index=monthly_dates,
+            columns=["AAPL", "MSFT"],
+        )
+        daily_dates = pd.bdate_range("2020-01-02", "2020-06-30")
+        n = len(daily_dates)
+        # AAPL = 0.0, MSFT = 0.02 → EW average = 0.01 per day
+        daily_data = np.column_stack([np.zeros(n), np.full(n, 0.02)])
+        daily_df = pd.DataFrame(daily_data, index=daily_dates, columns=["AAPL", "MSFT"])
+
+        signals = _make_signals(tickers=["AAPL", "MSFT"], dates=[date(2020, 3, 31)])
+        provider = MockFrequencyReturnsProvider(monthly_df, daily_df)
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        assert len(result.equity_curve) > 0
+        # EW should grow at 1% per day (average of 0% and 2%)
+        # Only holding-period days are in the curve: (2020-03-31, 2020-06-30]
+        n_holding = len(result.equity_curve)
+        expected_ew = 10_000.0 * (1.01 ** n_holding)
+        actual_ew = result.equity_curve[-1].ew_value
+        assert actual_ew == pytest.approx(expected_ew, rel=1e-4)
