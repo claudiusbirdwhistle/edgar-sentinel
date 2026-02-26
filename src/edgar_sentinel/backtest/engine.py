@@ -20,6 +20,7 @@ from edgar_sentinel.core.models import (
     BacktestConfig,
     BacktestResult,
     CompositeSignal,
+    EquityCurvePoint,
     MonthlyReturn,
     RebalanceFrequency,
 )
@@ -171,7 +172,13 @@ class BacktestEngine:
 
         metrics = self._metrics.compute_all(returns_series, signals, returns_df)
 
-        # Step 6: Package result
+        # Step 6: Compute equity curve
+        equity_curve = self._compute_equity_curve(
+            snapshots=self.portfolio_history.snapshots,
+            period_returns=monthly_returns,
+        )
+
+        # Step 7: Package result
         return BacktestResult(
             config=self._config,
             total_return=float(np.prod(1 + returns_series) - 1),
@@ -182,6 +189,7 @@ class BacktestEngine:
             monthly_returns=monthly_returns,
             factor_exposures=metrics.get("factor_exposures"),
             turnover=self.portfolio_history.average_turnover,
+            equity_curve=equity_curve,
         )
 
     def _compute_period_return(
@@ -258,6 +266,110 @@ class BacktestEngine:
             return 0.0
         total = float(np.prod(1 + monthly_returns) - 1)
         return (1 + total) ** (periods_per_year / n) - 1
+
+    def _compute_equity_curve(
+        self,
+        snapshots: list[PortfolioSnapshot],
+        period_returns: list[MonthlyReturn],
+        initial_value: float = 10_000.0,
+    ) -> list[EquityCurvePoint]:
+        """Compute a daily equity curve for portfolio, equal-weight, and SPY benchmarks.
+
+        For each holding period defined by the rebalanced snapshots, fetches
+        daily returns and compounds the portfolio value, a uniform equal-weight
+        benchmark (all universe tickers), and the SPY ETF.
+
+        Parameters
+        ----------
+        snapshots : list[PortfolioSnapshot]
+            Ordered list of portfolio snapshots from portfolio_history.
+        period_returns : list[MonthlyReturn]
+            Ordered period return records providing period_start/period_end dates.
+        initial_value : float
+            Starting notional account value in dollars. Default: $10,000.
+
+        Returns
+        -------
+        list[EquityCurvePoint]
+            One entry per trading day across the full backtest window,
+            in chronological order. Empty list if no daily data is available.
+        """
+        if not snapshots or not period_returns:
+            return []
+
+        # Fetch daily returns for universe + SPY
+        all_tickers = list(self._config.universe) + ["SPY"]
+        try:
+            daily_returns = self._returns.get_returns(
+                tickers=all_tickers,
+                start=self._config.start_date,
+                end=self._config.end_date,
+                frequency="daily",
+            )
+        except Exception as exc:
+            logger.warning("Could not fetch daily returns for equity curve: %s", exc)
+            return []
+
+        if daily_returns is None or daily_returns.empty:
+            return []
+
+        ew_tickers = [t for t in self._config.universe if t in daily_returns.columns]
+        has_spy = "SPY" in daily_returns.columns
+
+        portfolio_value = initial_value
+        spy_value = initial_value
+        ew_value = initial_value
+
+        points: list[EquityCurvePoint] = []
+
+        for snapshot, mr in zip(snapshots, period_returns):
+            period_start = mr.period_start
+            period_end = mr.period_end
+
+            # Select daily rows strictly inside (period_start, period_end]
+            mask = (daily_returns.index.date > period_start) & (
+                daily_returns.index.date <= period_end
+            )
+            period_daily = daily_returns.loc[mask]
+
+            for dt_idx, row in period_daily.iterrows():
+                dt: date = dt_idx.date() if hasattr(dt_idx, "date") else dt_idx  # type: ignore[assignment]
+
+                # Portfolio: weighted sum of position daily returns
+                port_ret = 0.0
+                for pos in snapshot.positions:
+                    if pos.ticker in row.index:
+                        val = row[pos.ticker]
+                        if not pd.isna(val):
+                            port_ret += pos.weight * float(val)
+                portfolio_value *= 1.0 + port_ret
+
+                # Equal-weight benchmark: average of available universe tickers
+                if ew_tickers:
+                    ew_vals = [
+                        float(row[t])
+                        for t in ew_tickers
+                        if t in row.index and not pd.isna(row[t])
+                    ]
+                    ew_ret = sum(ew_vals) / len(ew_vals) if ew_vals else 0.0
+                    ew_value *= 1.0 + ew_ret
+
+                # SPY benchmark
+                cur_spy: float | None = None
+                if has_spy and "SPY" in row.index and not pd.isna(row["SPY"]):
+                    spy_value *= 1.0 + float(row["SPY"])
+                    cur_spy = spy_value
+
+                points.append(
+                    EquityCurvePoint(
+                        date=dt,
+                        portfolio_value=round(portfolio_value, 4),
+                        spy_value=round(cur_spy, 4) if cur_spy is not None else None,
+                        ew_value=round(ew_value, 4),
+                    )
+                )
+
+        return points
 
 
 def run_backtest(

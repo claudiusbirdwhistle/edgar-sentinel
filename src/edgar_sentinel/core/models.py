@@ -355,6 +355,17 @@ class MonthlyReturn(BaseModel):
     benchmark_return: float | None = None
 
 
+class EquityCurvePoint(BaseModel):
+    """A single data point in a daily equity curve time series."""
+
+    model_config = ConfigDict(frozen=True)
+
+    date: date
+    portfolio_value: float
+    spy_value: float | None = None
+    ew_value: float
+
+
 class BacktestResult(BaseModel):
     """Complete results from a backtest run."""
 
@@ -369,3 +380,4 @@ class BacktestResult(BaseModel):
     monthly_returns: list[MonthlyReturn]
     factor_exposures: dict[str, float] | None = None
     turnover: float
+    equity_curve: list[EquityCurvePoint] = []
