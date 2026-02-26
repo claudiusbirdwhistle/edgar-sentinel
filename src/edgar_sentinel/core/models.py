@@ -75,6 +75,7 @@ class CompositeMethod(StrEnum):
 
     EQUAL = "equal"
     IC_WEIGHTED = "ic_weighted"
+    CUSTOM = "custom"
 
 
 # --- Filing Models ---
