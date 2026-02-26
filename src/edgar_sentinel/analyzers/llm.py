@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
@@ -63,11 +65,26 @@ class LLMProviderBackend(Protocol):
 # --- Provider Implementations ---
 
 
+def _find_claude_binary() -> str:
+    """Find the claude CLI binary, checking common installation paths."""
+    # Check common paths where Claude Code installs
+    candidates = [
+        "/home/agent/.local/bin/claude",
+        os.path.expanduser("~/.local/bin/claude"),
+        shutil.which("claude"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "claude"  # fall back to PATH lookup
+
+
 class ClaudeCLIProvider:
     """LLM provider using the local `claude` CLI binary.
 
     Runs `claude -p <prompt> --output-format json` as a subprocess.
     The CLI handles authentication via the user's existing session.
+    Automatically unsets CLAUDECODE to allow nested invocations.
     """
 
     def __init__(
@@ -77,6 +94,7 @@ class ClaudeCLIProvider:
     ) -> None:
         self._model = model
         self._timeout = timeout_seconds
+        self._binary = _find_claude_binary()
 
     @property
     def name(self) -> str:
@@ -84,17 +102,21 @@ class ClaudeCLIProvider:
 
     async def query(self, prompt: str, max_tokens: int = 1024) -> str:
         cmd = [
-            "claude", "-p", prompt,
+            self._binary, "-p", prompt,
             "--output-format", "json",
             "--model", self._model,
             "--max-turns", "1",
         ]
+
+        # Unset CLAUDECODE so the CLI doesn't refuse nested invocation
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
@@ -107,8 +129,9 @@ class ClaudeCLIProvider:
             )
         except FileNotFoundError:
             raise LLMError(
-                "Claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code",
-                context={"provider": self.name},
+                f"Claude CLI not found at {self._binary}. "
+                "Install it: npm install -g @anthropic-ai/claude-code",
+                context={"provider": self.name, "binary": self._binary},
             )
 
         if process.returncode != 0:
@@ -398,8 +421,20 @@ class LLMAnalyzer:
         """Analyze a single section using the LLM.
 
         Synchronous wrapper around the async implementation.
+        Handles both standalone and nested-event-loop contexts.
         """
-        return asyncio.run(self._analyze_async(section))
+        import concurrent.futures
+
+        try:
+            asyncio.get_running_loop()
+            # We're inside an event loop — run in a separate thread to
+            # avoid "asyncio.run() cannot be called when another loop is running"
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, self._analyze_async(section))
+                return future.result()
+        except RuntimeError:
+            # No running event loop — use asyncio.run directly
+            return asyncio.run(self._analyze_async(section))
 
     async def _analyze_async(self, section: FilingSection) -> SentimentResult:
         """Async implementation of single-section analysis."""
@@ -483,7 +518,15 @@ class LLMAnalyzer:
         sections: list[tuple[FilingSection, FilingSection | None]],
     ) -> list[SentimentResult]:
         """Analyze multiple sections with concurrent LLM requests."""
-        return asyncio.run(self._analyze_batch_async(sections))
+        import concurrent.futures
+
+        try:
+            asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, self._analyze_batch_async(sections))
+                return future.result()
+        except RuntimeError:
+            return asyncio.run(self._analyze_batch_async(sections))
 
     async def _analyze_batch_async(
         self,

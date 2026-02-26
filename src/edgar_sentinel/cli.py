@@ -191,25 +191,26 @@ def ingest(
                 task = progress.add_task("Ingesting filings...", total=len(ticker_list))
                 for ticker in ticker_list:
                     try:
-                        for year in range(start, end + 1):
-                            filings_meta = await client.search_filings(
-                                ticker=ticker,
-                                form_types=form_types,
-                                start_year=year,
-                                end_year=year,
-                            )
-                            for meta in filings_meta:
-                                if not force and await store.filing_exists(
-                                    meta.accession_number
-                                ):
-                                    continue
-                                raw = await client.download_filing(meta)
-                                sections = parser.parse(raw, meta)
-                                from edgar_sentinel.core import Filing
+                        from datetime import date as _date
+                        filings_meta = await client.get_filings_for_ticker(
+                            ticker=ticker,
+                            form_types=form_types,
+                            start_date=_date(start, 1, 1),
+                            end_date=_date(end, 12, 31),
+                        )
+                        for meta in filings_meta:
+                            if not force and await store.filing_exists(
+                                meta.accession_number
+                            ):
+                                continue
+                            url = await client.get_filing_url(meta)
+                            raw = await client.get_filing_document(url)
+                            sections = parser.parse(raw, meta.form_type, meta.accession_number)
+                            from edgar_sentinel.core import Filing
 
-                                filing = Filing(metadata=meta, sections=sections)
-                                await store.save_filing(filing)
-                                total_new += 1
+                            filing = Filing(metadata=meta, sections=sections)
+                            await store.save_filing(filing)
+                            total_new += 1
                     except Exception as exc:
                         total_errors += 1
                         if ctx.obj["verbose"]:
@@ -285,7 +286,7 @@ def analyze(
                 raise SystemExit(1)
 
             if ticker_list:
-                filings = [f for f in filings if f.metadata.ticker in ticker_list]
+                filings = [f for f in filings if f.ticker in ticker_list]
 
             total_results = 0
             for az in analyzers:
@@ -297,16 +298,33 @@ def analyze(
                     console=console,
                 ) as progress:
                     task = progress.add_task(f"{az_name}...", total=len(filings))
-                    for filing in filings:
+                    for meta in filings:
                         try:
-                            results = az.analyze(filing)
-                            for result in results:
-                                await store.save_sentiment(result)
-                                total_results += 1
+                            full_filing = await store.get_filing(meta.accession_number)
+                            if full_filing is None:
+                                progress.advance(task)
+                                continue
+                            for section in full_filing.sections.values():
+                                try:
+                                    result = az.analyze(section)
+                                    if hasattr(result, "sentiment_score"):
+                                        from edgar_sentinel.core import SimilarityResult
+                                        if isinstance(result, SimilarityResult):
+                                            await store.save_similarity(result)
+                                        else:
+                                            await store.save_sentiment(result)
+                                    else:
+                                        await store.save_similarity(result)
+                                    total_results += 1
+                                except Exception as exc:
+                                    if ctx.obj["verbose"]:
+                                        console.print(
+                                            f"[red]Error analyzing section {section.section_name}: {exc}[/red]"
+                                        )
                         except Exception as exc:
                             if ctx.obj["verbose"]:
                                 console.print(
-                                    f"[red]Error analyzing {filing.filing_id}: {exc}[/red]"
+                                    f"[red]Error analyzing {meta.accession_number}: {exc}[/red]"
                                 )
                         progress.advance(task)
 
@@ -356,22 +374,67 @@ def signals(
 ) -> None:
     """Build and display composite signals."""
     async def _run():
+        from datetime import date as date_type
+
+        from edgar_sentinel.analyzers.base import AnalysisResults
+        from edgar_sentinel.core import CompositeMethod
+        from edgar_sentinel.signals.builder import FilingDateMapping, SignalBuilder
+        from edgar_sentinel.signals.composite import SignalComposite
+
         config = _load_config(ctx)
         store = await _create_store_async(config)
         try:
-            composites = await store.get_composites(
+            as_of = signal_date.date() if signal_date else date_type.today()
+
+            # Build composites from stored sentiment/similarity results
+            filings_meta = await store.list_filings(
                 ticker=ticker.upper() if ticker else None,
             )
+            if not filings_meta:
+                console.print("[yellow]No filings found. Run 'ingest' first.[/yellow]")
+                raise SystemExit(1)
 
-            if not composites:
+            all_sentiments = []
+            all_similarities = []
+            filing_dates: dict = {}
+            for meta in filings_meta:
+                sents = await store.get_sentiments(meta.accession_number)
+                all_sentiments.extend(sents)
+                filing_dates[meta.accession_number] = FilingDateMapping(
+                    ticker=meta.ticker or "UNKNOWN",
+                    filing_id=meta.accession_number,
+                    filed_date=meta.filed_date,
+                    signal_date=meta.filed_date,
+                )
+
+            if not all_sentiments and not all_similarities:
                 console.print(
-                    "[yellow]No composite signals found. Run 'analyze' first.[/yellow]"
+                    "[yellow]No analysis results found. Run 'analyze' first.[/yellow]"
                 )
                 raise SystemExit(1)
 
-            if signal_date:
-                target = signal_date.date()
-                composites = [c for c in composites if c.signal_date == target]
+            analysis_results = AnalysisResults(
+                sentiment_results=all_sentiments,
+                similarity_results=all_similarities,
+            )
+
+            builder = SignalBuilder(config.signals)
+            raw_signals = builder.build(analysis_results, filing_dates, as_of)
+
+            if not raw_signals:
+                console.print("[yellow]No signals could be built from analysis results.[/yellow]")
+                raise SystemExit(1)
+
+            composite = SignalComposite(method=CompositeMethod.EQUAL)
+            composites = composite.combine(raw_signals, as_of_date=as_of)
+
+            # Persist composites
+            for c in composites:
+                await store.save_composite(c)
+
+            if not composites:
+                console.print("[yellow]No composite signals produced.[/yellow]")
+                raise SystemExit(1)
 
             # Sort by rank (or composite_score descending)
             composites.sort(key=lambda c: c.composite_score, reverse=True)
@@ -662,8 +725,8 @@ async def _gather_stats(store) -> dict:
     filings = await store.list_filings()
     composites = await store.get_composites()
 
-    tickers = {f.metadata.ticker for f in filings if f.metadata.ticker}
-    filing_dates = [f.metadata.filed_date for f in filings]
+    tickers = {f.ticker for f in filings if f.ticker}
+    filing_dates = [f.filed_date for f in filings]
     signal_dates = [c.signal_date for c in composites]
 
     return {
