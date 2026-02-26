@@ -377,6 +377,192 @@ class TestRunBacktest:
         assert "totalReturn" in result["strategy"]
         assert "sharpeRatio" in result["strategy"]
 
+    async def _run_backtest_with_composites(self, seeded_store, runner):
+        """Shared helper: run a backtest with 3 tickers, 4 quarterly dates."""
+        import pandas as pd
+        import numpy as np
+
+        composites = []
+        tickers = ["AAPL", "MSFT", "GOOGL"]
+        q_dates = [date(2024, 3, 31), date(2024, 6, 30), date(2024, 9, 30), date(2024, 12, 31)]
+        for ticker in tickers:
+            for q_date in q_dates:
+                c = CompositeSignal(
+                    ticker=ticker,
+                    signal_date=q_date,
+                    composite_score=0.1 * (tickers.index(ticker) + 1),  # deterministic scores
+                    components={"dictionary_mda": 0.5},
+                    rank=None,
+                )
+                await seeded_store.save_composite(c)
+                composites.append(c)
+
+        config = {
+            "ingestion": {"tickers": "AAPL,MSFT,GOOGL", "startYear": 2024, "endYear": 2025},
+            "signals": {"bufferDays": 2},
+            "backtest": {"rebalanceFrequency": "quarterly", "numQuantiles": 3, "longQuantile": 1},
+        }
+
+        dates_idx = pd.date_range("2024-01-31", "2025-12-31", freq="ME")
+        mock_returns = pd.DataFrame(
+            np.full((len(dates_idx), 4), 0.02),  # 2% per period
+            index=dates_idx,
+            columns=["AAPL", "MSFT", "GOOGL", "SPY"],
+        )
+
+        with patch("edgar_sentinel.backtest.returns.YFinanceProvider") as MockProvider:
+            instance = MockProvider.return_value
+            instance.get_returns = MagicMock(return_value=mock_returns)
+            result = await runner.run_backtest(
+                seeded_store, config, config["backtest"], composites
+            )
+
+        return result, composites
+
+    async def test_backtest_returns_portfolio_history_key(self, seeded_store):
+        """run_backtest() result must include portfolioHistory key."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        assert "portfolioHistory" in result
+
+    async def test_backtest_portfolio_history_is_list(self, seeded_store):
+        """portfolioHistory must be a non-empty list."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        assert isinstance(ph, list)
+        assert len(ph) > 0
+
+    async def test_backtest_portfolio_history_snapshot_structure(self, seeded_store):
+        """Each portfolioHistory entry must have required top-level keys."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        for snapshot in ph:
+            assert "rebalanceDate" in snapshot
+            assert "portfolioValue" in snapshot
+            assert "turnover" in snapshot
+            assert "transactionCost" in snapshot
+            assert "positions" in snapshot
+            assert "nLong" in snapshot
+            assert "nShort" in snapshot
+
+    async def test_backtest_portfolio_history_position_structure(self, seeded_store):
+        """Each position in portfolioHistory must have required fields."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        for snapshot in ph:
+            for pos in snapshot["positions"]:
+                assert "ticker" in pos
+                assert "weight" in pos
+                assert "quantile" in pos
+                assert "signalScore" in pos
+                assert "leg" in pos
+                assert "dollarValue" in pos
+
+    async def test_backtest_portfolio_history_dollar_values(self, seeded_store):
+        """dollarValue should equal portfolioValue * abs(weight) for each position."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        for snapshot in ph:
+            pv = snapshot["portfolioValue"]
+            for pos in snapshot["positions"]:
+                expected = round(pv * abs(pos["weight"]), 2)
+                assert abs(pos["dollarValue"] - expected) < 0.02  # allow rounding
+
+    async def test_backtest_portfolio_history_leg_values(self, seeded_store):
+        """Long positions should have leg='long', short positions leg='short'."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        for snapshot in ph:
+            for pos in snapshot["positions"]:
+                if pos["weight"] >= 0:
+                    assert pos["leg"] == "long"
+                else:
+                    assert pos["leg"] == "short"
+
+    async def test_backtest_portfolio_history_first_value_is_initial(self, seeded_store):
+        """First portfolioHistory entry should have portfolioValue=10000.0."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        assert ph[0]["portfolioValue"] == pytest.approx(10000.0, rel=1e-3)
+
+    async def test_backtest_portfolio_history_nlong_matches_positions(self, seeded_store):
+        """nLong should match number of long positions in each snapshot."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        ph = result["portfolioHistory"]
+        for snapshot in ph:
+            actual_long = sum(1 for p in snapshot["positions"] if p["leg"] == "long")
+            assert snapshot["nLong"] == actual_long
+
+    async def test_backtest_returns_signal_history_key(self, seeded_store):
+        """run_backtest() result must include signalHistory key."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        assert "signalHistory" in result
+
+    async def test_backtest_signal_history_is_list(self, seeded_store):
+        """signalHistory must be a non-empty list."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        assert isinstance(sh, list)
+        assert len(sh) > 0
+
+    async def test_backtest_signal_history_entry_structure(self, seeded_store):
+        """Each signalHistory entry must have date and signals."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        for entry in sh:
+            assert "date" in entry
+            assert "signals" in entry
+            assert isinstance(entry["signals"], list)
+
+    async def test_backtest_signal_history_sorted_by_score(self, seeded_store):
+        """Signals within each date should be sorted by compositeScore descending."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        for entry in sh:
+            scores = [s["compositeScore"] for s in entry["signals"]]
+            assert scores == sorted(scores, reverse=True)
+
+    async def test_backtest_signal_history_ranks_sequential(self, seeded_store):
+        """Ranks in each signalHistory entry should be sequential starting from 1."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        for entry in sh:
+            ranks = [s["rank"] for s in entry["signals"]]
+            assert ranks == list(range(1, len(ranks) + 1))
+
+    async def test_backtest_signal_history_signal_structure(self, seeded_store):
+        """Each signal in signalHistory must have ticker, compositeScore, and rank."""
+        runner = _import_runner()
+        result, _ = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        for entry in sh:
+            for sig in entry["signals"]:
+                assert "ticker" in sig
+                assert "compositeScore" in sig
+                assert "rank" in sig
+
+    async def test_backtest_signal_history_dates_match_composites(self, seeded_store):
+        """signalHistory dates should correspond to composite signal dates."""
+        runner = _import_runner()
+        result, composites = await self._run_backtest_with_composites(seeded_store, runner)
+        sh = result["signalHistory"]
+        composite_dates = {c.signal_date.isoformat() for c in composites}
+        signal_history_dates = {entry["date"] for entry in sh}
+        # All signalHistory dates should be from composite dates
+        assert signal_history_dates.issubset(composite_dates)
+
 
 # =============================================================================
 # Full Pipeline Integration
