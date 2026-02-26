@@ -1,0 +1,22 @@
+services:
+  edgar-sentinel:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "${SENTINEL_PORT:-8000}:8000"
+    volumes:
+      - sentinel-data:/app/data
+    environment:
+      - EDGAR_SENTINEL_EDGAR__USER_AGENT=${EDGAR_USER_AGENT:?Set EDGAR_USER_AGENT to "YourName your@email.com"}
+      - EDGAR_SENTINEL_API__API_KEY=${SENTINEL_API_KEY:-}
+      - EDGAR_SENTINEL_STORAGE__DATABASE_URL=sqlite:///app/data/sentinel.db
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  sentinel-data:

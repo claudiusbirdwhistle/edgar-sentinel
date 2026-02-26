@@ -1,0 +1,25 @@
+services:
+  edgar-sentinel-dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    volumes:
+      - ../src:/app/src:ro
+      - ../tests:/app/tests:ro
+    environment:
+      - EDGAR_SENTINEL_EDGAR__USER_AGENT=DevAgent dev@localhost
+      - EDGAR_SENTINEL_STORAGE__DATABASE_URL=sqlite:///tmp/test-sentinel.db
+
+  edgar-sentinel-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.dev
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../src:/app/src
+      - ../tests:/app/tests
+    environment:
+      - EDGAR_SENTINEL_EDGAR__USER_AGENT=DevAgent dev@localhost
+      - EDGAR_SENTINEL_STORAGE__DATABASE_URL=sqlite:///tmp/dev-sentinel.db
+    command: ["edgar-sentinel", "serve", "--host", "0.0.0.0", "--port", "8000"]
