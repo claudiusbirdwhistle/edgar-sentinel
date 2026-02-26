@@ -12,9 +12,11 @@ from edgar_sentinel.analyzers.dictionary import (
     DictionaryAnalyzer,
     LMDictionary,
 )
+from edgar_sentinel.analyzers.similarity import SimilarityAnalyzer
 
 # Register built-in analyzers
 registry.register("dictionary", DictionaryAnalyzer)
+registry.register("similarity", SimilarityAnalyzer)
 
 __all__ = [
     "Analyzer",
@@ -23,6 +25,7 @@ __all__ = [
     "AnalysisResults",
     "DictionaryAnalyzer",
     "LMDictionary",
+    "SimilarityAnalyzer",
     "registry",
     "run_analyzers",
 ]
