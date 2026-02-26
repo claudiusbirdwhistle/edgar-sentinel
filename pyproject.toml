@@ -31,6 +31,7 @@ dependencies = [
     "pyyaml >= 6.0",
     # Ingestion
     "httpx >= 0.25",
+    "aiolimiter >= 1.1",
     "beautifulsoup4 >= 4.12",
     "lxml >= 4.9",
     # Analyzers
@@ -88,6 +89,7 @@ markers = [
     "e2e: End-to-end tests (requires network access to EDGAR)",
 ]
 addopts = "-m 'not e2e' --strict-markers"
+asyncio_mode = "auto"
 
 [tool.ruff]
 target-version = "py311"
