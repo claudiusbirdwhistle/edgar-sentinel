@@ -284,3 +284,74 @@ class TestAnnualize:
         total = (1.01**6) - 1
         expected = (1 + total) ** (12.0 / 6) - 1
         assert ann == pytest.approx(expected, rel=1e-6)
+
+    def test_quarterly_factor(self):
+        # 4 quarters at 3% each → annualized with periods_per_year=4
+        returns = pd.Series([0.03] * 4)
+        ann = BacktestEngine._annualize(returns, periods_per_year=4.0)
+        total = (1.03 ** 4) - 1
+        expected = (1 + total) ** (4.0 / 4) - 1  # same as total for 1 year
+        assert ann == pytest.approx(expected, rel=1e-6)
+
+    def test_quarterly_partial_year(self):
+        # 2 quarters at 3% each → annualized with periods_per_year=4
+        returns = pd.Series([0.03] * 2)
+        ann = BacktestEngine._annualize(returns, periods_per_year=4.0)
+        total = (1.03 ** 2) - 1
+        expected = (1 + total) ** (4.0 / 2) - 1
+        assert ann == pytest.approx(expected, rel=1e-6)
+
+
+class TestQuarterlyAnnualization:
+    """Tests verifying the engine correctly annualizes quarterly backtests."""
+
+    def test_quarterly_engine_uses_periods_per_year_4(self):
+        """BacktestEngine with quarterly config should use annualization_factor=4."""
+        config = _make_config(rebalance_frequency="quarterly")
+        provider = MockReturnsProvider(_make_returns())
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        engine.run(signals)
+
+        # The engine should have configured its MetricsCalculator with factor 4
+        assert engine._metrics._af == 4
+
+    def test_monthly_engine_uses_periods_per_year_12(self):
+        """BacktestEngine with monthly config should use annualization_factor=12."""
+        config = _make_config(rebalance_frequency="monthly")
+        provider = MockReturnsProvider(_make_returns())
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        engine.run(signals)
+
+        assert engine._metrics._af == 12
+
+    def test_quarterly_annualized_return_correct(self):
+        """Quarterly annualized return should use 4 periods/year, not 12."""
+        config = _make_config(rebalance_frequency="quarterly")
+        provider = MockReturnsProvider(_make_returns())
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        # Re-derive expected: (1 + total_return) ^ (4 / n_periods) - 1
+        n = len(result.monthly_returns)
+        expected = (1 + result.total_return) ** (4.0 / n) - 1
+        assert result.annualized_return == pytest.approx(expected, rel=1e-6)
+
+    def test_monthly_returns_have_period_start(self):
+        """MonthlyReturn entries should include a non-None period_start date."""
+        config = _make_config(rebalance_frequency="quarterly")
+        provider = MockReturnsProvider(_make_returns())
+        signals = _make_signals()
+
+        engine = BacktestEngine(config, provider)
+        result = engine.run(signals)
+
+        for mr in result.monthly_returns:
+            assert mr.period_start is not None
+            assert isinstance(mr.period_start, date)
+            assert mr.period_start < mr.period_end

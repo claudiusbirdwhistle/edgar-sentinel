@@ -1,0 +1,26 @@
+edgar:
+  user_agent: "EDGAR-Sentinel-Agent agent@example.com"
+  rate_limit: 10
+  cache_dir: "./data/filings"
+
+storage:
+  backend: sqlite
+  sqlite_path: "./data/edgar_sentinel.db"
+
+analyzers:
+  dictionary:
+    enabled: true
+    dictionary_path: "./data/lm_dictionary.csv"
+  similarity:
+    enabled: true
+  llm:
+    enabled: false
+
+signals:
+  buffer_days: 2
+  decay_half_life: 90
+  composite_method: equal
+
+backtest:
+  start_date: "2023-01-01"
+  end_date: "2025-12-31"

@@ -339,10 +339,15 @@ class BacktestConfig(BaseModel):
 
 
 class MonthlyReturn(BaseModel):
-    """A single month's return data from a backtest."""
+    """A single holding-period's return data from a backtest.
+
+    Named 'MonthlyReturn' for historical reasons; the period may be
+    monthly or quarterly depending on the rebalance_frequency config.
+    """
 
     model_config = ConfigDict(frozen=True)
 
+    period_start: date | None = None
     period_end: date
     long_return: float
     short_return: float | None = None

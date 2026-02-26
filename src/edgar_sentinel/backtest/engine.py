@@ -21,6 +21,7 @@ from edgar_sentinel.core.models import (
     BacktestResult,
     CompositeSignal,
     MonthlyReturn,
+    RebalanceFrequency,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,18 @@ class BacktestEngine:
     ) -> None:
         self._config = config
         self._returns = returns_provider
-        self._metrics = metrics_calculator or MetricsCalculator()
+        # Determine periods per year from rebalance frequency
+        self._periods_per_year: float = (
+            4.0
+            if config.rebalance_frequency == RebalanceFrequency.QUARTERLY
+            else 12.0
+        )
+        if metrics_calculator is None:
+            self._metrics = MetricsCalculator(
+                annualization_factor=int(self._periods_per_year)
+            )
+        else:
+            self._metrics = metrics_calculator
         self.portfolio_history = PortfolioHistory()
 
     def run(self, signals: list[CompositeSignal]) -> BacktestResult:
@@ -140,6 +152,7 @@ class BacktestEngine:
 
             monthly_returns.append(
                 MonthlyReturn(
+                    period_start=rebalance_date,
                     period_end=period_end,
                     long_return=long_ret,
                     short_return=short_ret,
@@ -162,7 +175,7 @@ class BacktestEngine:
         return BacktestResult(
             config=self._config,
             total_return=float(np.prod(1 + returns_series) - 1),
-            annualized_return=self._annualize(returns_series),
+            annualized_return=self._annualize(returns_series, self._periods_per_year),
             sharpe_ratio=metrics["sharpe_ratio"],
             max_drawdown=metrics["max_drawdown"],
             information_ratio=metrics.get("information_ratio"),
@@ -225,16 +238,26 @@ class BacktestEngine:
         return float(np.prod(1 + period_rets) - 1)
 
     @staticmethod
-    def _annualize(monthly_returns: pd.Series) -> float:
-        """Annualize a monthly return series.
+    def _annualize(
+        monthly_returns: pd.Series, periods_per_year: float = 12.0
+    ) -> float:
+        """Annualize a return series.
 
-        annualized = (1 + total_return) ^ (12 / n_months) - 1
+        annualized = (1 + total_return) ^ (periods_per_year / n_periods) - 1
+
+        Parameters
+        ----------
+        monthly_returns : pd.Series
+            Series of per-period returns (one value per rebalance period).
+        periods_per_year : float
+            Number of rebalance periods per calendar year.
+            12 for monthly rebalancing, 4 for quarterly.
         """
         n = len(monthly_returns)
         if n == 0:
             return 0.0
         total = float(np.prod(1 + monthly_returns) - 1)
-        return (1 + total) ** (12.0 / n) - 1
+        return (1 + total) ** (periods_per_year / n) - 1
 
 
 def run_backtest(
