@@ -629,6 +629,64 @@ class SqliteStore:
                 context={"operation": "query", "table": "composite_signals"},
             ) from e
 
+    # --- Convenience Methods (for API layer) ---
+
+    async def get_statistics(self) -> dict[str, int]:
+        """Return aggregate counts for the health endpoint."""
+        try:
+            stats = {}
+            for table, key in [
+                ("filings", "total_filings"),
+                ("sentiment_results", "sentiment_results"),
+                ("similarity_results", "similarity_results"),
+                ("signals", "individual_signals"),
+                ("composite_signals", "composite_signals"),
+            ]:
+                async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cur:
+                    row = await cur.fetchone()
+                stats[key] = row[0] if row else 0
+            return stats
+        except Exception as e:
+            if isinstance(e, StorageError):
+                raise
+            raise StorageError(
+                f"Failed to get statistics: {e}",
+                context={"operation": "query"},
+            ) from e
+
+    async def get_all_tickers(self) -> list[str]:
+        """Return all unique tickers with at least one filing."""
+        try:
+            async with self._db.execute(
+                "SELECT DISTINCT ticker FROM filings WHERE ticker IS NOT NULL ORDER BY ticker"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+        except Exception as e:
+            if isinstance(e, StorageError):
+                raise
+            raise StorageError(
+                f"Failed to get tickers: {e}",
+                context={"operation": "query", "table": "filings"},
+            ) from e
+
+    async def get_section_names(self, accession_number: str) -> list[str]:
+        """Return section names for a filing."""
+        try:
+            async with self._db.execute(
+                "SELECT section_name FROM filing_sections WHERE filing_id = ? ORDER BY section_name",
+                (accession_number,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+        except Exception as e:
+            if isinstance(e, StorageError):
+                raise
+            raise StorageError(
+                f"Failed to get section names: {e}",
+                context={"operation": "query", "table": "filing_sections"},
+            ) from e
+
     # --- Row Mapping Helpers ---
 
     async def _get_sections(
