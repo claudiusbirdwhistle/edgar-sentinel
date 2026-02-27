@@ -795,3 +795,266 @@ class TestEdgeCases:
         await store.save_composite(comp)
         results = await store.get_composites(ticker="AAPL")
         assert results[0].rank is None
+
+
+# --- Batch / Bulk Efficiency Methods ---
+
+
+class TestBatchMethods:
+    """Tests for the batch query/save helpers added for ingestion performance."""
+
+    # --- get_filing_accession_numbers ---
+
+    async def test_get_filing_accession_numbers_empty_db(self, store):
+        result = await store.get_filing_accession_numbers()
+        assert result == set()
+
+    async def test_get_filing_accession_numbers_all(self, store, make_filing, make_filing_metadata):
+        f1 = make_filing()
+        f2 = make_filing(
+            metadata_overrides={
+                "ticker": "MSFT",
+                "accession_number": "0000789019-23-000001",
+                "filed_date": date(2023, 7, 27),
+                "cik": "0000789019",
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        result = await store.get_filing_accession_numbers()
+        assert "0000320193-23-000106" in result
+        assert "0000789019-23-000001" in result
+        assert len(result) == 2
+
+    async def test_get_filing_accession_numbers_filtered_by_tickers(
+        self, store, make_filing
+    ):
+        f1 = make_filing()  # AAPL
+        f2 = make_filing(
+            metadata_overrides={
+                "ticker": "MSFT",
+                "accession_number": "0000789019-23-000001",
+                "filed_date": date(2023, 7, 27),
+                "cik": "0000789019",
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        result = await store.get_filing_accession_numbers(tickers=["AAPL"])
+        assert "0000320193-23-000106" in result
+        assert "0000789019-23-000001" not in result
+
+    async def test_get_filing_accession_numbers_ticker_case_insensitive(
+        self, store, make_filing
+    ):
+        await store.save_filing(make_filing())
+        result_lower = await store.get_filing_accession_numbers(tickers=["aapl"])
+        result_upper = await store.get_filing_accession_numbers(tickers=["AAPL"])
+        assert result_lower == result_upper
+        assert len(result_lower) == 1
+
+    # --- get_existing_sentiment_keys ---
+
+    async def test_get_existing_sentiment_keys_empty(self, store):
+        result = await store.get_existing_sentiment_keys([])
+        assert result == set()
+
+    async def test_get_existing_sentiment_keys_returns_tuples(
+        self, store, make_filing, make_sentiment
+    ):
+        filing = make_filing()
+        await store.save_filing(filing)
+        s1 = make_sentiment(section_name="mda", analyzer_name="dictionary")
+        s2 = make_sentiment(section_name="risk_factors", analyzer_name="dictionary")
+        await store.save_sentiment(s1)
+        await store.save_sentiment(s2)
+        acc = filing.metadata.accession_number
+        result = await store.get_existing_sentiment_keys([acc])
+        assert (acc, "mda", "dictionary") in result
+        assert (acc, "risk_factors", "dictionary") in result
+        assert len(result) == 2
+
+    async def test_get_existing_sentiment_keys_unknown_filing(self, store):
+        result = await store.get_existing_sentiment_keys(["nonexistent-acc"])
+        assert result == set()
+
+    async def test_get_existing_sentiment_keys_multiple_filings(
+        self, store, make_filing, make_filing_metadata, make_sentiment
+    ):
+        f1 = make_filing()
+        f2 = make_filing(
+            metadata_overrides={
+                "accession_number": "0000320193-22-000108",
+                "filed_date": date(2022, 11, 3),
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        s1 = make_sentiment(filing_id=f1.metadata.accession_number)
+        s2 = make_sentiment(
+            filing_id=f2.metadata.accession_number,
+            section_name="risk_factors",
+        )
+        await store.save_sentiment(s1)
+        await store.save_sentiment(s2)
+        result = await store.get_existing_sentiment_keys(
+            [f1.metadata.accession_number, f2.metadata.accession_number]
+        )
+        assert (f1.metadata.accession_number, "mda", "dictionary") in result
+        assert (f2.metadata.accession_number, "risk_factors", "dictionary") in result
+
+    # --- get_existing_similarity_keys ---
+
+    async def test_get_existing_similarity_keys_empty(self, store):
+        result = await store.get_existing_similarity_keys([])
+        assert result == set()
+
+    async def test_get_existing_similarity_keys_returns_tuples(
+        self, store, make_filing, make_similarity
+    ):
+        f1 = make_filing()
+        f2 = make_filing(
+            metadata_overrides={
+                "accession_number": "0000320193-22-000108",
+                "filed_date": date(2022, 11, 3),
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        sim = make_similarity(
+            filing_id=f1.metadata.accession_number,
+            prior_filing_id=f2.metadata.accession_number,
+        )
+        await store.save_similarity(sim)
+        result = await store.get_existing_similarity_keys([f1.metadata.accession_number])
+        assert (f1.metadata.accession_number, "mda") in result
+
+    async def test_get_existing_similarity_keys_unknown_filing(self, store):
+        result = await store.get_existing_similarity_keys(["nonexistent-acc"])
+        assert result == set()
+
+    # --- save_sentiments_batch ---
+
+    async def test_save_sentiments_batch_empty(self, store):
+        # Should not raise
+        await store.save_sentiments_batch([])
+
+    async def test_save_sentiments_batch_inserts_all(
+        self, store, make_filing, make_sentiment
+    ):
+        filing = make_filing()
+        await store.save_filing(filing)
+        acc = filing.metadata.accession_number
+        results = [
+            make_sentiment(section_name="mda", sentiment_score=0.10),
+            make_sentiment(section_name="risk_factors", sentiment_score=0.20),
+        ]
+        await store.save_sentiments_batch(results)
+        mda = await store.get_sentiments(acc, section_name="mda")
+        risk = await store.get_sentiments(acc, section_name="risk_factors")
+        assert len(mda) == 1
+        assert mda[0].sentiment_score == 0.10
+        assert len(risk) == 1
+        assert risk[0].sentiment_score == 0.20
+
+    async def test_save_sentiments_batch_upserts(
+        self, store, make_filing, make_sentiment
+    ):
+        filing = make_filing()
+        await store.save_filing(filing)
+        acc = filing.metadata.accession_number
+        s_old = make_sentiment(sentiment_score=0.10)
+        await store.save_sentiment(s_old)
+        # Batch with updated score for the same (filing_id, section, analyzer)
+        s_new = make_sentiment(sentiment_score=0.99)
+        await store.save_sentiments_batch([s_new])
+        results = await store.get_sentiments(acc)
+        assert len(results) == 1
+        assert results[0].sentiment_score == 0.99
+
+    async def test_save_sentiments_batch_matches_individual_saves(
+        self, store, make_filing, make_sentiment
+    ):
+        """Batch save should produce identical DB state to individual saves."""
+        filing = make_filing()
+        await store.save_filing(filing)
+        acc = filing.metadata.accession_number
+        items = [
+            make_sentiment(section_name="mda", sentiment_score=0.1),
+            make_sentiment(section_name="risk_factors", sentiment_score=0.2),
+        ]
+        await store.save_sentiments_batch(items)
+        all_results = await store.get_sentiments(acc)
+        scores = {r.section_name: r.sentiment_score for r in all_results}
+        assert scores == {"mda": 0.1, "risk_factors": 0.2}
+
+    # --- save_similarities_batch ---
+
+    async def test_save_similarities_batch_empty(self, store):
+        await store.save_similarities_batch([])
+
+    async def test_save_similarities_batch_inserts_all(
+        self, store, make_filing, make_similarity
+    ):
+        f1 = make_filing()
+        f2 = make_filing(
+            metadata_overrides={
+                "accession_number": "0000320193-22-000108",
+                "filed_date": date(2022, 11, 3),
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        sims = [
+            make_similarity(
+                filing_id=f1.metadata.accession_number,
+                prior_filing_id=f2.metadata.accession_number,
+                section_name="mda",
+                similarity_score=0.80,
+                change_score=0.20,
+            ),
+            make_similarity(
+                filing_id=f1.metadata.accession_number,
+                prior_filing_id=f2.metadata.accession_number,
+                section_name="risk_factors",
+                similarity_score=0.70,
+                change_score=0.30,
+            ),
+        ]
+        await store.save_similarities_batch(sims)
+        mda = await store.get_similarity(f1.metadata.accession_number, section_name="mda")
+        risk = await store.get_similarity(f1.metadata.accession_number, section_name="risk_factors")
+        assert len(mda) == 1
+        assert mda[0].similarity_score == 0.80
+        assert len(risk) == 1
+        assert risk[0].similarity_score == 0.70
+
+    async def test_save_similarities_batch_upserts(
+        self, store, make_filing, make_similarity
+    ):
+        f1 = make_filing()
+        f2 = make_filing(
+            metadata_overrides={
+                "accession_number": "0000320193-22-000108",
+                "filed_date": date(2022, 11, 3),
+            }
+        )
+        await store.save_filing(f1)
+        await store.save_filing(f2)
+        s_old = make_similarity(
+            filing_id=f1.metadata.accession_number,
+            prior_filing_id=f2.metadata.accession_number,
+            similarity_score=0.50,
+            change_score=0.50,
+        )
+        await store.save_similarity(s_old)
+        s_new = make_similarity(
+            filing_id=f1.metadata.accession_number,
+            prior_filing_id=f2.metadata.accession_number,
+            similarity_score=0.99,
+            change_score=0.01,
+        )
+        await store.save_similarities_batch([s_new])
+        results = await store.get_similarity(f1.metadata.accession_number)
+        assert len(results) == 1
+        assert results[0].similarity_score == 0.99

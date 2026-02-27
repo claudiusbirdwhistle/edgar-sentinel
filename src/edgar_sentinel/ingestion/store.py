@@ -629,6 +629,156 @@ class SqliteStore:
                 context={"operation": "query", "table": "composite_signals"},
             ) from e
 
+    # --- Batch / Bulk Efficiency Methods ---
+
+    async def get_filing_accession_numbers(
+        self,
+        tickers: list[str] | None = None,
+    ) -> set[str]:
+        """Return the set of all accession numbers in the DB.
+
+        Optionally filter to a list of tickers so callers can do a fast
+        in-memory membership check instead of one ``get_filing()`` per filing.
+        """
+        try:
+            query = "SELECT accession_number FROM filings"
+            params: list = []
+            if tickers:
+                placeholders = ",".join("?" * len(tickers))
+                query += f" WHERE UPPER(ticker) IN ({placeholders})"
+                params = [t.upper() for t in tickers]
+            async with self._db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+            return {row[0] for row in rows}
+        except Exception as e:
+            raise StorageError(
+                f"Failed to get accession numbers: {e}",
+                context={"operation": "query", "table": "filings"},
+            ) from e
+
+    async def get_existing_sentiment_keys(
+        self, filing_ids: list[str]
+    ) -> set[tuple[str, str, str]]:
+        """Return ``(filing_id, section_name, analyzer_name)`` for all
+        existing sentiment results matching *filing_ids*.
+
+        Allows a single bulk query instead of one per section per filing.
+        """
+        if not filing_ids:
+            return set()
+        try:
+            placeholders = ",".join("?" * len(filing_ids))
+            async with self._db.execute(
+                f"SELECT filing_id, section_name, analyzer_name"
+                f" FROM sentiment_results WHERE filing_id IN ({placeholders})",
+                filing_ids,
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return {(row[0], row[1], row[2]) for row in rows}
+        except Exception as e:
+            raise StorageError(
+                f"Failed to get existing sentiment keys: {e}",
+                context={"operation": "query", "table": "sentiment_results"},
+            ) from e
+
+    async def get_existing_similarity_keys(
+        self, filing_ids: list[str]
+    ) -> set[tuple[str, str]]:
+        """Return ``(filing_id, section_name)`` for all existing similarity
+        results matching *filing_ids*.
+
+        Allows a single bulk query instead of one per section per filing.
+        """
+        if not filing_ids:
+            return set()
+        try:
+            placeholders = ",".join("?" * len(filing_ids))
+            async with self._db.execute(
+                f"SELECT filing_id, section_name"
+                f" FROM similarity_results WHERE filing_id IN ({placeholders})",
+                filing_ids,
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return {(row[0], row[1]) for row in rows}
+        except Exception as e:
+            raise StorageError(
+                f"Failed to get existing similarity keys: {e}",
+                context={"operation": "query", "table": "similarity_results"},
+            ) from e
+
+    async def save_sentiments_batch(self, results: list[SentimentResult]) -> None:
+        """Bulk-insert sentiment results using a single transaction.
+
+        Dramatically faster than calling ``save_sentiment`` N times when
+        there are many new results to persist (avoids N individual commits).
+        """
+        if not results:
+            return
+        try:
+            data = [
+                (
+                    r.filing_id,
+                    r.section_name,
+                    r.analyzer_name,
+                    r.sentiment_score,
+                    r.confidence,
+                    json.dumps(r.metadata) if r.metadata else None,
+                    r.analyzed_at.isoformat(),
+                )
+                for r in results
+            ]
+            await self._db.executemany(
+                """INSERT OR REPLACE INTO sentiment_results
+                   (filing_id, section_name, analyzer_name, sentiment_score,
+                    confidence, metadata_json, analyzed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                data,
+            )
+            await self._db.commit()
+        except Exception as e:
+            if isinstance(e, StorageError):
+                raise
+            raise StorageError(
+                f"Failed to save sentiments batch: {e}",
+                context={"operation": "executemany", "table": "sentiment_results"},
+            ) from e
+
+    async def save_similarities_batch(self, results: list[SimilarityResult]) -> None:
+        """Bulk-insert similarity results using a single transaction.
+
+        Dramatically faster than calling ``save_similarity`` N times when
+        there are many new results to persist (avoids N individual commits).
+        """
+        if not results:
+            return
+        try:
+            data = [
+                (
+                    r.filing_id,
+                    r.prior_filing_id,
+                    r.section_name,
+                    r.similarity_score,
+                    r.change_score,
+                    r.analyzed_at.isoformat(),
+                )
+                for r in results
+            ]
+            await self._db.executemany(
+                """INSERT OR REPLACE INTO similarity_results
+                   (filing_id, prior_filing_id, section_name,
+                    similarity_score, change_score, analyzed_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                data,
+            )
+            await self._db.commit()
+        except Exception as e:
+            if isinstance(e, StorageError):
+                raise
+            raise StorageError(
+                f"Failed to save similarities batch: {e}",
+                context={"operation": "executemany", "table": "similarity_results"},
+            ) from e
+
     # --- Convenience Methods (for API layer) ---
 
     async def get_statistics(self) -> dict[str, int]:
