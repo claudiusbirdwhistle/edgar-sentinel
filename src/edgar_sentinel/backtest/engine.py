@@ -16,6 +16,7 @@ from edgar_sentinel.backtest.portfolio import (
     generate_rebalance_dates,
 )
 from edgar_sentinel.backtest.returns import ReturnsProvider
+from edgar_sentinel.backtest.universe import StaticUniverseProvider, UniverseProvider
 from edgar_sentinel.core.models import (
     BacktestConfig,
     BacktestResult,
@@ -47,6 +48,7 @@ class BacktestEngine:
         config: BacktestConfig,
         returns_provider: ReturnsProvider,
         metrics_calculator: MetricsCalculator | None = None,
+        universe_provider: UniverseProvider | None = None,
     ) -> None:
         self._config = config
         self._returns = returns_provider
@@ -63,6 +65,14 @@ class BacktestEngine:
         else:
             self._metrics = metrics_calculator
         self.portfolio_history = PortfolioHistory()
+        # Universe provider: enables survivorship-bias-free backtests by
+        # filtering signals to only index members on each rebalance date.
+        # Defaults to a static provider wrapping config.universe.
+        self._universe_provider: UniverseProvider = (
+            universe_provider
+            if universe_provider is not None
+            else StaticUniverseProvider(list(config.universe))
+        )
 
     def run(self, signals: list[CompositeSignal]) -> BacktestResult:
         """Execute the full backtest simulation.
@@ -92,14 +102,21 @@ class BacktestEngine:
                 f"and {self._config.end_date}"
             )
 
+        # Step 2: Determine superset of all tickers across all rebalance dates
+        # (needed so we can fetch returns for tickers that may only appear on
+        # certain dates when using a dynamic universe provider).
+        all_universe_tickers: set[str] = set(self._config.universe)
+        for rd in rebalance_dates:
+            all_universe_tickers.update(self._universe_provider.get_tickers(rd))
+
         logger.info(
             f"Running backtest: {len(rebalance_dates)} rebalance dates, "
-            f"{len(self._config.universe)} tickers"
+            f"{len(all_universe_tickers)} tickers (superset)"
         )
 
-        # Step 2: Fetch returns
+        # Step 2: Fetch returns for the full superset
         returns_df = self._returns.get_returns(
-            tickers=list(self._config.universe),
+            tickers=list(all_universe_tickers),
             start=self._config.start_date,
             end=self._config.end_date,
             frequency="monthly",
@@ -114,9 +131,13 @@ class BacktestEngine:
         portfolio_returns: list[float] = []
 
         for i, rebalance_date in enumerate(rebalance_dates):
-            # 3a: Construct portfolio
+            # 3a: Filter signals to the active universe on this rebalance date
+            active_tickers = set(self._universe_provider.get_tickers(rebalance_date))
+            date_signals = [s for s in signals if s.ticker in active_tickers]
+
+            # 3b: Construct portfolio from filtered signals
             try:
-                snapshot = constructor.construct(signals, rebalance_date)
+                snapshot = constructor.construct(date_signals, rebalance_date)
             except ValueError as e:
                 logger.warning(f"Skipping rebalance {rebalance_date}: {e}")
                 continue
