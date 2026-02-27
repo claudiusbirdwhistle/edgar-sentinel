@@ -294,6 +294,25 @@ class CompositeSignal(BaseModel):
 # --- Backtest Models ---
 
 
+class UniverseSource(StrEnum):
+    """How the backtest universe is determined.
+
+    ``STATIC``
+        The same fixed list of tickers is used for all rebalance dates
+        (default, backward-compatible).  Susceptible to survivorship bias
+        when backtesting against current index constituents.
+
+    ``SP500_HISTORICAL``
+        The set of S&P 500 members that were *actually* in the index on
+        each rebalance date is used.  Data is downloaded from
+        `fja05680/sp500 <https://github.com/fja05680/sp500>`_ on first use.
+        This eliminates survivorship bias for S&P 500 strategies.
+    """
+
+    STATIC = "static"
+    SP500_HISTORICAL = "sp500_historical"
+
+
 class BacktestConfig(BaseModel):
     """Configuration for a backtest run."""
 
@@ -308,6 +327,7 @@ class BacktestConfig(BaseModel):
     long_quantile: int = 1
     short_quantile: int | None = None
     transaction_cost_bps: int = 10
+    universe_source: UniverseSource = UniverseSource.STATIC
 
     @field_validator("universe")
     @classmethod
